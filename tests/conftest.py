@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 
 from guardrail_proxy.config import Settings
 from guardrail_proxy.main import create_app
+from guardrail_proxy.providers.azure import AzureOpenAIProvider
+from guardrail_proxy.providers.openai import OpenAICompatibleProvider
 
 
 class FakeLLM:
@@ -18,6 +20,7 @@ class FakeLLM:
     def __init__(self) -> None:
         self.answer = "Hello! How can I help?"
         self.received: list[dict[str, Any]] = []
+        self.requests: list[httpx.Request] = []
         self.status = 200
         self.fail = False
 
@@ -28,6 +31,7 @@ class FakeLLM:
             return httpx.Response(200, json={"object": "list", "data": [{"id": "llama3"}]})
         body = json.loads(request.content)
         self.received.append(body)
+        self.requests.append(request)
         if self.status != 200:
             return httpx.Response(self.status, json={"error": {"message": "upstream says no"}})
         return httpx.Response(
@@ -36,7 +40,7 @@ class FakeLLM:
                 "id": "chatcmpl-test",
                 "object": "chat.completion",
                 "created": 1,
-                "model": body["model"],
+                "model": body.get("model", "azure-deployment"),
                 "choices": [
                     {
                         "index": 0,
@@ -56,10 +60,12 @@ def llm() -> FakeLLM:
 
 @pytest.fixture
 def make_client(llm: FakeLLM):
-    def _make(**overrides: Any) -> TestClient:
-        settings = Settings(backend_url="http://fake/v1", _env_file=None, **overrides)
-        app = create_app(settings, transport=httpx.MockTransport(llm.handler))
-        return TestClient(app)
+    def _make(provider: str = "openai", **overrides: Any) -> TestClient:
+        overrides.setdefault("backend_url", "http://fake/v1")
+        settings = Settings(backend_provider=provider, _env_file=None, **overrides)
+        cls = AzureOpenAIProvider if provider == "azure" else OpenAICompatibleProvider
+        backend = cls(settings, transport=httpx.MockTransport(llm.handler))
+        return TestClient(create_app(settings, provider=backend))
 
     return _make
 

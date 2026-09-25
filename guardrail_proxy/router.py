@@ -13,9 +13,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
 from .audit import audit, digest
-from .backend import Backend, BackendError
 from .config import Settings
 from .pipeline import inspect_input, inspect_output, system_prompts
+from .providers import BackendError, Provider
 from .schemas import ChatCompletionRequest, openai_error
 
 router = APIRouter()
@@ -25,7 +25,7 @@ def _settings(request: Request) -> Settings:
     return request.app.state.settings
 
 
-def _backend(request: Request) -> Backend:
+def _backend(request: Request) -> Provider:
     return request.app.state.backend
 
 
@@ -47,7 +47,7 @@ def _err(status: int, message: str, type_: str, code: str | None = None) -> JSON
 
 
 @router.get("/v1/models", dependencies=[Depends(require_client_key)])
-async def list_models(backend: Backend = Depends(_backend)) -> JSONResponse:
+async def list_models(backend: Provider = Depends(_backend)) -> JSONResponse:
     try:
         status, body = await backend.models()
     except BackendError as exc:
@@ -59,12 +59,13 @@ async def list_models(backend: Backend = Depends(_backend)) -> JSONResponse:
 async def chat_completions(
     request: Request,
     settings: Settings = Depends(_settings),
-    backend: Backend = Depends(_backend),
+    backend: Provider = Depends(_backend),
 ):
     started = time.perf_counter()
     rid = request.state.request_id
     event: dict[str, Any] = {
         "request_id": rid,
+        "provider": backend.name,
         "client_ip": request.client.host if request.client else None,
     }
 

@@ -6,15 +6,14 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 
-import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import HTTPException
 from fastapi.responses import JSONResponse
 
 from . import __version__
 from .audit import configure_logging
-from .backend import Backend
 from .config import Settings, get_settings
+from .providers import Provider, build_provider
 from .router import router
 from .schemas import openai_error
 
@@ -23,15 +22,15 @@ _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 def create_app(
     settings: Settings | None = None,
-    transport: httpx.AsyncBaseTransport | None = None,
+    provider: Provider | None = None,
 ) -> FastAPI:
-    """``transport`` lets tests swap the real network for an in-process fake."""
+    """``provider`` lets tests inject an adapter wired to an in-process fake backend."""
     settings = settings or get_settings()
     configure_logging(settings.log_level, settings.log_file)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.backend = Backend(settings, transport=transport)
+        app.state.backend = provider or build_provider(settings)
         yield
         await app.state.backend.aclose()
 

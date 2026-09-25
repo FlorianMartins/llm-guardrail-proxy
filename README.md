@@ -4,10 +4,14 @@
 ![Python](https://img.shields.io/badge/python-3.11%20|%203.12%20|%203.13-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-**A drop-in, OpenAI-compatible security proxy for LLM traffic.** It sits between your
-applications and any model backend (Ollama, vLLM, OpenAI, OpenRouter...), inspects every
-prompt and every answer, and writes a structured audit trail. There is **no SDK and no code
-change** on the client side: you point `base_url` at the proxy.
+**A multi-provider security proxy for LLM traffic.** It sits between your applications and
+the model, whether the model runs **locally** (Ollama, vLLM, LM Studio, llama.cpp) or at a
+**hosted provider** (OpenAI, Azure OpenAI, Anthropic Claude, Mistral, Gemini, OpenRouter...).
+It inspects every prompt and every answer, and writes a structured audit trail.
+
+Clients speak the OpenAI API, the de facto standard that every major SDK and framework
+supports, so there is **no code change** on the client side: point `base_url` at the proxy.
+The proxy translates to the provider's own API when it differs (Azure, Anthropic).
 
 ```
 client ──► [ auth ─► size limit ─► injection check ─► PII masking ] ──► LLM backend
@@ -28,7 +32,7 @@ with N partial implementations and no central view. A proxy makes the policy a
 |---|---|---|
 | Policy consistency | Varies per team | One policy, versioned, reviewed once |
 | Audit | Scattered or missing | One JSON stream to your SIEM |
-| Switching model / vendor | Code change | Change `GUARD_BACKEND_URL` |
+| Switching model / vendor | Code change | Change two environment variables |
 | Cost of an attack | Tokens are spent first | Blocked **before** the model is called |
 | Data residency | Raw PII reaches the vendor | PII masked before it leaves your network |
 
@@ -50,7 +54,9 @@ flowchart LR
         R -.-> L
     end
 
-    B <-->|OpenAI-compatible| LLM[(Ollama · vLLM · OpenAI · OpenRouter)]
+    B <-->|OpenAI dialect| LLM1[(Ollama · vLLM · OpenAI · Mistral · Gemini · OpenRouter)]
+    B <-->|deployment URL + api-key| LLM2[(Azure OpenAI)]
+    B <-->|Messages API, translated| LLM3[(Anthropic Claude)]
 ```
 
 The code keeps **detection** and **decision** apart:
@@ -65,7 +71,10 @@ guardrail_proxy/
 │   ├── injection.py   #   weighted jailbreak / injection rules (+ base64 payloads)
 │   ├── pii.py         #   PII & secret detectors with validators (Luhn, IBAN mod-97)
 │   └── output.py      #   leak, dangerous-command and system-prompt-leak checks
-├── backend.py         # async client for any OpenAI-compatible backend
+├── providers/         # ADAPTERS: translate at the edge, guards never see a difference
+│   ├── openai.py      #   any OpenAI-compatible API (local or hosted)
+│   ├── azure.py       #   Azure OpenAI: deployment URLs, api-key header
+│   └── anthropic.py   #   Claude via the official SDK, OpenAI <-> Messages translation
 ├── audit.py           # structured JSON logging
 ├── config.py          # 12-factor settings (GUARD_* env vars)
 └── schemas.py         # permissive OpenAI request model
@@ -74,6 +83,63 @@ guardrail_proxy/
 Guards are pure functions returning `Finding` objects, so they can be unit-tested
 in isolation and a new detector (an ML classifier, a vendor API) plugs in without
 touching policy. Changing a policy never requires touching detection code either.
+
+Guards always inspect the **OpenAI-shaped** request, *before* any provider translation,
+and the **OpenAI-shaped** answer, *after* it. A security rule is therefore written once
+and applies identically to every backend.
+
+## Supported backends
+
+| Backend | `GUARD_BACKEND_PROVIDER` | `GUARD_BACKEND_URL` |
+|---|---|---|
+| **Ollama** (local) | `openai` | `http://localhost:11434/v1` (the default) |
+| **vLLM** (local / self-hosted) | `openai` | `http://localhost:8000/v1` |
+| **LM Studio** (local) | `openai` | `http://localhost:1234/v1` |
+| **llama.cpp** `llama-server` (local) | `openai` | `http://localhost:8080/v1` |
+| **OpenAI** | `openai` | `https://api.openai.com/v1` |
+| **Mistral** | `openai` | `https://api.mistral.ai/v1` |
+| **Google Gemini** | `openai` | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| **Groq** | `openai` | `https://api.groq.com/openai/v1` |
+| **DeepSeek** | `openai` | `https://api.deepseek.com/v1` |
+| **OpenRouter** (hundreds of models, one key) | `openai` | `https://openrouter.ai/api/v1` |
+| **Azure OpenAI** | `azure` | `https://<resource>.openai.azure.com` |
+| **Anthropic Claude** | `anthropic` | *(leave unset)* |
+
+Set the provider's key in `GUARD_BACKEND_API_KEY`. The `openai` rows share one adapter
+because these services expose the same API; the adapter itself is tested, while each hosted
+service was not individually exercised.
+
+### Azure OpenAI
+
+Azure addresses a **deployment** rather than a model, and authenticates with an `api-key`
+header. Clients keep sending `model: "<your-deployment-name>"`; the proxy builds
+`/openai/deployments/<name>/chat/completions?api-version=...` (set `GUARD_AZURE_API_VERSION`
+to change the version). Deployment names are checked against a strict allowlist, so a
+crafted `model` value can never reshape the upstream URL. Azure's own content filter still
+runs, and its refusals are passed through unchanged.
+
+### Anthropic Claude
+
+The adapter uses the official `anthropic` SDK (retries, typed errors) and translates both
+ways:
+
+| OpenAI request | Anthropic Messages API |
+|---|---|
+| `system` / `developer` messages | top-level `system` |
+| text and `image_url` parts (URL or `data:` base64) | `text` and `image` blocks |
+| `assistant.tool_calls` / `tool` messages | `tool_use` / `tool_result` blocks (parallel results grouped in one turn) |
+| `tools`, `tool_choice` (`auto`, `none`, `required`, named), `parallel_tool_calls` | `tools`, `tool_choice`, `disable_parallel_tool_use` |
+| `max_completion_tokens` / `max_tokens` | `max_tokens` (required by Anthropic, default `GUARD_ANTHROPIC_MAX_TOKENS`) |
+| `stop` | `stop_sequences` |
+| `reasoning_effort` | `output_config.effort` |
+| `response_format: json_schema` | `output_config.format` (structured outputs) |
+| `user` | `metadata.user_id` |
+
+Answers come back as a normal `chat.completion`: `stop_reason` becomes `finish_reason`
+(`refusal` becomes `content_filter`), `tool_use` becomes `tool_calls`, cached input tokens
+are counted in `prompt_tokens`, and errors keep the OpenAI error shape. `temperature` and
+`top_p` are deliberately **not** forwarded, since current Claude models reject them
+(`reasoning_effort` is the supported control).
 
 ## Security use cases
 
@@ -169,14 +235,32 @@ client = OpenAI(base_url="http://localhost:8000/v1", api_key="your-proxy-key")
 client.chat.completions.create(model="llama3.2:1b", messages=[{"role": "user", "content": "Hi"}])
 ```
 
-### Using a hosted API instead of Ollama
+### Using a hosted provider instead of Ollama
 
 ```bash
+# Any OpenAI-compatible service (OpenAI, Mistral, Gemini, OpenRouter...)
 docker run -p 8000:8000 \
-  -e GUARD_BACKEND_URL=https://api.openai.com/v1 \
-  -e GUARD_BACKEND_API_KEY=sk-... \
+  -e GUARD_BACKEND_URL=https://api.mistral.ai/v1 \
+  -e GUARD_BACKEND_API_KEY=... \
   -e GUARD_PROXY_API_KEYS='["a-long-random-client-key"]' \
   llm-guardrail-proxy
+
+# Anthropic Claude
+docker run -p 8000:8000 \
+  -e GUARD_BACKEND_PROVIDER=anthropic \
+  -e GUARD_BACKEND_API_KEY=sk-ant-... \
+  -e GUARD_PROXY_API_KEYS='["a-long-random-client-key"]' \
+  llm-guardrail-proxy
+# then: client.chat.completions.create(model="claude-opus-5", messages=[...])
+
+# Azure OpenAI
+docker run -p 8000:8000 \
+  -e GUARD_BACKEND_PROVIDER=azure \
+  -e GUARD_BACKEND_URL=https://my-resource.openai.azure.com \
+  -e GUARD_BACKEND_API_KEY=... \
+  -e GUARD_PROXY_API_KEYS='["a-long-random-client-key"]' \
+  llm-guardrail-proxy
+# then: client.chat.completions.create(model="my-gpt-deployment", messages=[...])
 ```
 
 ## Configuration
@@ -185,8 +269,11 @@ All settings are environment variables (or a `.env` file, see [`.env.example`](.
 
 | Variable | Default | Description |
 |---|---|---|
-| `GUARD_BACKEND_URL` | `http://localhost:11434/v1` | Any OpenAI-compatible base URL |
-| `GUARD_BACKEND_API_KEY` | none | Sent upstream as `Authorization: Bearer` |
+| `GUARD_BACKEND_PROVIDER` | `openai` | `openai` (any OpenAI-compatible API), `azure` or `anthropic` |
+| `GUARD_BACKEND_URL` | Ollama (`openai`), SDK default (`anthropic`) | Base URL, or the Azure resource endpoint (required for `azure`) |
+| `GUARD_BACKEND_API_KEY` | none | Provider key, sent in the header each provider expects |
+| `GUARD_AZURE_API_VERSION` | `2024-10-21` | Azure OpenAI `api-version` |
+| `GUARD_ANTHROPIC_MAX_TOKENS` | `16000` | `max_tokens` sent to Claude when the client sets none |
 | `GUARD_BACKEND_TIMEOUT_S` | `60` | Upstream timeout |
 | `GUARD_PROXY_API_KEYS` | `[]` (open) | JSON list of client keys accepted by the proxy |
 | `GUARD_INJECTION_ACTION` | `block` | `block` rejects, `flag` forwards and logs (shadow mode) |
@@ -205,13 +292,14 @@ All settings are environment variables (or a `.env` file, see [`.env.example`](.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
-pytest -q           # 56 tests, runs in ~0.1 s, no network (fake in-process backend)
+pytest -q           # 77 tests, well under a second, no network (fake in-process backends)
 ruff check . && ruff format --check .
 GUARD_BACKEND_URL=http://localhost:11434/v1 guardrail-proxy
 ```
 
-The test suite checks **what actually leaves the proxy**, because the fake backend
-records every request it receives. It covers the attack corpus, a set of benign prompts
+The test suite checks **what actually leaves the proxy**, because the fake backends
+record every request they receive. The Anthropic tests go through the real SDK against a
+fake Messages API, so headers, paths and payloads are the ones Claude would receive. It covers the attack corpus, a set of benign prompts
 that must *not* be blocked (false positives), streaming, auth, backend failures, and an
 assertion that the audit log never contains raw PII.
 
