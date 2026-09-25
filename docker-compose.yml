@@ -1,0 +1,27 @@
+# Proxy + a local Ollama. Clients talk to :8000 exactly as they would to OpenAI.
+services:
+  proxy:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      GUARD_BACKEND_URL: http://ollama:11434/v1
+      GUARD_INJECTION_ACTION: block
+      GUARD_OUTPUT_ACTION: redact
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      - ollama
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama:/root/.ollama
+    # Not published on the host: the only way in is through the proxy.
+
+volumes:
+  ollama:
