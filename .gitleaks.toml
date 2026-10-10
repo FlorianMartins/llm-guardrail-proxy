@@ -1,0 +1,8 @@
+# Gitleaks configuration (read by the "security / Secret scanning" job).
+# Keep every default rule; only exempt files whose matches are known not to be secrets.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fake credentials used as fixtures by the redaction tests"
+paths = ['''^tests/test_guards\.py$''']
